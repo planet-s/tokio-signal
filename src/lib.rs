@@ -144,4 +144,13 @@ pub fn ctrl_c_handle(handle: &Handle) -> IoFuture<IoStream<()>> {
                 .map(|x| Box::new(x) as Box<Stream<Item = _, Error = _> + Send>)
         }))
     }
+
+    #[cfg(not(any(unix, windows)))]
+    fn ctrl_c_imp(_handle: &Handle) -> IoFuture<IoStream<()>> {
+        // Unimplemented on unsupported systems
+
+        use futures::stream;
+        let empty: IoStream<()> = Box::new(stream::empty());
+        Box::new(future::ok(empty))
+    }
 }
