@@ -1,27 +1,24 @@
-//! Unix-specific types for signal handling.
+//! Redox-specific types for signal handling.
 //!
 //! This module is only defined on Unix platforms and contains the primary
 //! `Signal` type for receiving notifications of signals.
 
-#![cfg(unix)]
+#![cfg(target_os = "redox")]
 
-pub extern crate libc;
+pub extern crate syscall;
 extern crate mio;
-extern crate mio_uds;
 
 use std::cell::UnsafeCell;
+use std::fs::File;
 use std::io;
 use std::io::prelude::*;
-use std::mem;
 use std::os::unix::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, ONCE_INIT};
 
-use self::libc::c_int;
 use self::mio::unix::EventedFd;
 use self::mio::Poll as MioPoll;
 use self::mio::{Evented, PollOpt, Ready, Token};
-use self::mio_uds::UnixStream;
 use futures::future;
 use futures::sync::mpsc::{channel, Receiver, Sender};
 use futures::{Async, AsyncSink, Future};
@@ -29,26 +26,24 @@ use futures::{Poll, Sink, Stream};
 use tokio_reactor::{Handle, PollEvented};
 use tokio_io::IoFuture;
 
-pub use self::libc::{SIGUSR1, SIGUSR2, SIGINT, SIGTERM};
-pub use self::libc::{SIGALRM, SIGHUP, SIGPIPE, SIGQUIT, SIGTRAP, SIGCHLD};
+pub use self::syscall::{SIGUSR1, SIGUSR2, SIGINT, SIGTERM};
+pub use self::syscall::{SIGALRM, SIGHUP, SIGPIPE, SIGQUIT, SIGTRAP, SIGCHLD};
 
-// Number of different unix signals
-// (FreeBSD has 33)
+// Number of different signals
 const SIGNUM: usize = 33;
 
 struct SignalInfo {
     pending: AtomicBool,
     // The ones interested in this signal
-    recipients: Mutex<Vec<Box<Sender<c_int>>>>,
+    recipients: Mutex<Vec<Box<Sender<usize>>>>,
 
     init: Once,
-    initialized: UnsafeCell<bool>,
-    prev: UnsafeCell<libc::sigaction>,
+    initialized: UnsafeCell<bool>
 }
 
 struct Globals {
-    sender: UnixStream,
-    receiver: UnixStream,
+    sender: File,
+    receiver: File,
     signals: Vec<SignalInfo>,
 }
 
@@ -59,7 +54,6 @@ impl Default for SignalInfo {
             init: ONCE_INIT,
             initialized: UnsafeCell::new(false),
             recipients: Mutex::new(Vec::new()),
-            prev: UnsafeCell::new(unsafe { mem::zeroed() }),
         }
     }
 }
@@ -71,10 +65,11 @@ fn globals() -> &'static Globals {
 
     unsafe {
         INIT.call_once(|| {
-            let (receiver, sender) = UnixStream::pair().unwrap();
+            let mut fds = [0, 0];
+            syscall::pipe2(&mut fds, syscall::O_NONBLOCK | syscall::O_CLOEXEC).unwrap();
             let globals = Globals {
-                sender: sender,
-                receiver: receiver,
+                sender: File::from_raw_fd(fds[1]),
+                receiver: File::from_raw_fd(fds[0]),
                 signals: (0..SIGNUM).map(|_| Default::default()).collect(),
             };
             GLOBALS = Box::into_raw(Box::new(globals));
@@ -90,12 +85,8 @@ fn globals() -> &'static Globals {
 /// 1. Flag that our specific signal was received (e.g. store an atomic flag)
 /// 2. Wake up driver tasks by writing a byte to a pipe
 ///
-/// Those two operations shoudl both be async-signal safe. After that's done we
-/// just try to call a previous signal handler, if any, to be "good denizens of
-/// the internet"
-extern "C" fn handler(signum: c_int, info: *mut libc::siginfo_t, ptr: *mut libc::c_void) {
-    type FnSigaction = extern "C" fn(c_int, *mut libc::siginfo_t, *mut libc::c_void);
-    type FnHandler = extern "C" fn(c_int);
+/// Those two operations should both be async-signal safe.
+extern "C" fn handler(signum: usize) {
     unsafe {
         let slot = match (*GLOBALS).signals.get(signum as usize) {
             Some(slot) => slot,
@@ -105,23 +96,7 @@ extern "C" fn handler(signum: c_int, info: *mut libc::siginfo_t, ptr: *mut libc:
 
         // Send a wakeup, ignore any errors (anything reasonably possible is
         // full pipe and then it will wake up anyway).
-        drop((*GLOBALS).sender.write(&[1]));
-
-        let fnptr = (*slot.prev.get()).sa_sigaction;
-        if fnptr == 0 || fnptr == libc::SIG_DFL || fnptr == libc::SIG_IGN {
-            return;
-        }
-        #[cfg(all(target_os = "android", target_pointer_width = "64"))]
-        let contains_siginfo = (*slot.prev.get()).sa_flags & libc::SA_SIGINFO as libc::c_uint;
-        #[cfg(not(all(target_os = "android", target_pointer_width = "64")))]
-        let contains_siginfo = (*slot.prev.get()).sa_flags & libc::SA_SIGINFO;
-        if contains_siginfo == 0 {
-            let action = mem::transmute::<usize, FnHandler>(fnptr);
-            action(signum)
-        } else {
-            let action = mem::transmute::<usize, FnSigaction>(fnptr);
-            action(signum, info, ptr)
-        }
+        (*GLOBALS).sender.write(&[1]).expect("temporary panic when writing to check if things work");
     }
 }
 
@@ -130,33 +105,24 @@ extern "C" fn handler(signum: c_int, info: *mut libc::siginfo_t, ptr: *mut libc:
 ///
 /// This will register the signal handler if it hasn't already been registered,
 /// returning any error along the way if that fails.
-fn signal_enable(signal: c_int) -> io::Result<()> {
+fn signal_enable(signal: usize) -> io::Result<()> {
     let siginfo = match globals().signals.get(signal as usize) {
         Some(slot) => slot,
         None => return Err(io::Error::new(io::ErrorKind::Other, "signal too large")),
     };
     unsafe {
-        #[cfg(all(target_os = "android", target_pointer_width = "32"))]
-        fn flags() -> libc::c_ulong {
-            (libc::SA_RESTART as libc::c_ulong) | libc::SA_SIGINFO
-                | (libc::SA_NOCLDSTOP as libc::c_ulong)
-        }
-        #[cfg(all(target_os = "android", target_pointer_width = "64"))]
-        fn flags() -> libc::c_uint {
-            (libc::SA_RESTART as libc::c_uint) | (libc::SA_SIGINFO as libc::c_uint)
-                | (libc::SA_NOCLDSTOP as libc::c_uint)
-        }
-        #[cfg(not(target_os = "android"))]
-        fn flags() -> c_int {
-            libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NOCLDSTOP
+        fn flags() -> usize {
+            syscall::SA_RESTART | syscall::SA_SIGINFO | syscall::SA_NOCLDSTOP
         }
         let mut err = None;
         siginfo.init.call_once(|| {
-            let mut new: libc::sigaction = mem::zeroed();
-            new.sa_sigaction = handler as usize;
-            new.sa_flags = flags();
-            if libc::sigaction(signal, &new, &mut *siginfo.prev.get()) != 0 {
-                err = Some(io::Error::last_os_error());
+            let new = syscall::SigAction {
+                sa_handler: handler,
+                sa_flags: flags(),
+                ..Default::default()
+            };
+            if let Err(error) = syscall::sigaction(signal, Some(&new), None) {
+                err = Some(io::Error::from_raw_os_error(error.errno as i32));
             } else {
                 *siginfo.initialized.get() = true;
             }
@@ -278,7 +244,7 @@ impl Driver {
                 continue;
             }
 
-            let signum = sig as c_int;
+            let signum = sig as usize;
             let mut recipients = slot.recipients.lock().unwrap();
 
             // Notify all waiters on this signal that the signal has been
@@ -339,13 +305,13 @@ impl Driver {
 /// alleviate some of these limitations if possible!
 pub struct Signal {
     driver: Driver,
-    signal: c_int,
+    signal: usize,
     // Used only as an identifier. We place the real sender into a Box, so it
     // stays on the same address forever. That gives us a unique pointer, so we
     // can use this to identify the sender in a Vec and delete it when we are
     // dropped.
-    id: *const Sender<c_int>,
-    rx: Receiver<c_int>,
+    id: *const Sender<usize>,
+    rx: Receiver<usize>,
 }
 
 // The raw pointer prevents the compiler from determining it as Send
@@ -372,7 +338,7 @@ impl Signal {
     /// A `Signal` stream can be created for a particular signal number
     /// multiple times. When a signal is received then all the associated
     /// channels will receive the signal notification.
-    pub fn new(signal: c_int) -> IoFuture<Signal> {
+    pub fn new(signal: usize) -> IoFuture<Signal> {
         Signal::with_handle(signal, &Handle::current())
     }
 
@@ -394,12 +360,12 @@ impl Signal {
     /// A `Signal` stream can be created for a particular signal number
     /// multiple times. When a signal is received then all the associated
     /// channels will receive the signal notification.
-    pub fn with_handle(signal: c_int, handle: &Handle) -> IoFuture<Signal> {
+    pub fn with_handle(signal: usize, handle: &Handle) -> IoFuture<Signal> {
         let handle = handle.clone();
         Box::new(future::lazy(move || {
             let result = (|| {
                 // Turn the signal delivery on once we are ready for it
-                try!(signal_enable(signal));
+                try!(signal_enable(signal as usize));
 
                 // Ensure there's a driver for our associated event loop processing
                 // signals.
@@ -416,7 +382,7 @@ impl Signal {
                     driver: driver,
                     rx: rx,
                     id: id,
-                    signal: signal,
+                    signal: signal as usize,
                 })
             })();
             future::result(result)
@@ -425,10 +391,10 @@ impl Signal {
 }
 
 impl Stream for Signal {
-    type Item = c_int;
+    type Item = usize;
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<Option<c_int>, io::Error> {
+    fn poll(&mut self) -> Poll<Option<usize>, io::Error> {
         self.driver.poll().unwrap();
         // receivers don't generate errors
         self.rx.poll().map_err(|_| panic!())

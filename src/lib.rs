@@ -88,7 +88,12 @@ use futures::stream::Stream;
 use futures::{future, Future};
 use tokio_reactor::Handle;
 
+#[cfg(unix)]
 pub mod unix;
+#[cfg(target_os = "redox")]
+pub mod redox;
+#[cfg(target_os = "redox")]
+pub use redox as unix;
 pub mod windows;
 
 /// A future whose error is `io::Error`
@@ -126,11 +131,11 @@ pub fn ctrl_c() -> IoFuture<IoStream<()>> {
 pub fn ctrl_c_handle(handle: &Handle) -> IoFuture<IoStream<()>> {
     return ctrl_c_imp(handle);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "redox"))]
     fn ctrl_c_imp(handle: &Handle) -> IoFuture<IoStream<()>> {
         let handle = handle.clone();
         Box::new(future::lazy(move || {
-            unix::Signal::with_handle(unix::libc::SIGINT, &handle)
+            unix::Signal::with_handle(unix::SIGINT, &handle)
                 .map(|x| Box::new(x.map(|_| ())) as Box<Stream<Item = _, Error = _> + Send>)
         }))
     }
@@ -145,7 +150,7 @@ pub fn ctrl_c_handle(handle: &Handle) -> IoFuture<IoStream<()>> {
         }))
     }
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(any(unix, target_os = "redox", windows)))]
     fn ctrl_c_imp(_handle: &Handle) -> IoFuture<IoStream<()>> {
         // Unimplemented on unsupported systems
 
